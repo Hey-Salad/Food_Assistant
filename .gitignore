@@ -1,0 +1,37 @@
+# PlatformIO
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+
+# Build outputs
+*.bin
+*.elf
+*.map
+
+# IDE
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Secrets (important!)
+secrets.h
+credentials.h
+
+# Logs
+*.log
+
+# SD card test files
+/data/photos/*
+!/data/photos/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes

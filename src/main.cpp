@@ -1,4 +1,267 @@
-#include <Arduino.h>
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("\n\n=== HeySalad Starting ===");
+    
+    pinMode(LED_GPIO_NUM, OUTPUT);
+    randomSeed(analogRead(0));
+    
+    // Initialize authentication
+    auth.begin();
+    
+    preferences.begin("heysalad", true);
+    wifiSSID = preferences.getString("ssid", "");
+    wifiPassword = preferences.getString("password", "");
+    openaiKey = preferences.getString("openai", "");
+    elevenlabsKey = preferences.getString("elevenlabs", "");
+    geminiKey = preferences.getString("gemini", "");
+    deepseekKey = preferences.getString("deepseek", "");
+    isConfigured = preferences.getBool("configured", false);
+    preferences.end();
+    
+    if (!wifiSSID.isEmpty()) {
+        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+        Serial.print("Connecting to WiFi");
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+        }
+    } else {
+        WiFi.softAP("HeySalad-Setup");
+        Serial.println("AP: HeySalad-Setup @ 192.168.4.1");
+    }
+    
+    cameraOK = initCamera();
+    audioOK = initAudio();
+    
+    ws.onEvent(onWSEvent);
+    server.addHandler(&ws);
+    
+    // Main page (requires auth)
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!isConfigured) {
+            request->send(200, "text/html", setupHTML);
+            return;
+        }
+        
+        String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+        if (token.isEmpty() && request->hasParam("token")) {
+            token = request->getParam("token")->value();
+        }
+        
+        if (auth.verifySession(token)) {
+            request->send(200, "text/html", mainHTML);
+        } else {
+            request->send(200, "text/html", loginHTML);
+        }
+    });
+    
+    // Login endpoint
+    server.on("/login", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            JsonDocument doc;
+            deserializeJson(doc, data);
+            String password = doc["password"].as<String>();
+            
+            String token = auth.login(password);
+            if (!token.isEmpty()) {
+                String json = "{\"token\":\"" + token + "\",\"ok\":true}";
+                request->send(200, "application/json", json);
+            } else {
+                request->send(401, "application/json", "{\"ok\":false,\"error\":\"Invalid password\"}");
+            }
+        });
+    
+    // Logout endpoint
+    server.on("/logout", HTTP_POST, [](AsyncWebServerRequest *request) {
+        String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+        auth.logout(token);
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+    
+    // Check if using default password
+    server.on("/is_default_password", HTTP_GET, [](AsyncWebServerRequest *request) {
+        bool isDefault = !auth.isSetupComplete();
+        String json = "{\"isDefault\":" + String(isDefault ? "true" : "false") + "}";
+        request->send(200, "application/json", json);
+    });
+    
+    // Change password
+    server.on("/change_password", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+            if (!auth.verifySession(token)) {
+                request->send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}");
+                return;
+            }
+            
+            JsonDocument doc;
+            deserializeJson(doc, data);
+            String oldPwd = doc["old"].as<String>();
+            String newPwd = doc["new"].as<String>();
+            
+            if (auth.changePassword(oldPwd, newPwd)) {
+                request->send(200, "application/json", "{\"ok\":true}");
+            } else {
+                request->send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid old password\"}");
+            }
+        });
+    
+    server.on("/logo.svg", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "image/svg+xml", logoSVG);
+    });
+    
+    server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String token = request->hasParam("token") ? request->getParam("token")->value() : "";
+        if (!auth.verifySession(token)) {
+            request->send(401, "text/plain", "Unauthorized");
+            return;
+        }
+        
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            request->send(500, "text/plain", "Camera failed");
+            return;
+        }
+        AsyncWebServerResponse *response = request->beginResponse_P(
+            200, "image/jpeg", fb->buf, fb->len
+        );
+        request->send(response);
+        esp_camera_fb_return(fb);
+    });
+    
+    server.on("/get_keys", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+        if (!auth.verifySession(token)) {
+            request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+            return;
+        }
+        
+        String json = "{";
+        json += "\"openai\":\"" + (openaiKey.isEmpty() ? "" : "***") + "\",";
+        json += "\"elevenlabs\":\"" + (elevenlabsKey.isEmpty() ? "" : "***") + "\",";
+        json += "\"gemini\":\"" + (geminiKey.isEmpty() ? "" : "***") + "\",";
+        json += "\"deepseek\":\"" + (deepseekKey.isEmpty() ? "" : "***") + "\"";
+        json += "}";
+        request->send(200, "application/json", json);
+    });
+    
+    server.on("/save_keys", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+            if (!auth.verifySession(token)) {
+                request->send(401, "application/json", "{\"ok\":false}");
+                return;
+            }
+            
+            JsonDocument doc;
+            deserializeJson(doc, data);
+            
+            preferences.begin("heysalad", false);
+            if (doc["openai"].as<String>() != "***") preferences.putString("openai", doc["openai"].as<String>());
+            if (doc["elevenlabs"].as<String>() != "***") preferences.putString("elevenlabs", doc["elevenlabs"].as<String>());
+            if (doc["gemini"].as<String>() != "***") preferences.putString("gemini", doc["gemini"].as<String>());
+            if (doc["deepseek"].as<String>() != "***") preferences.putString("deepseek", doc["deepseek"].as<String>());
+            preferences.end();
+            
+            openaiKey = preferences.getString("openai", "");
+            elevenlabsKey = preferences.getString("elevenlabs", "");
+            geminiKey = preferences.getString("gemini", "");
+            deepseekKey = preferences.getString("deepseek", "");
+            
+            request->send(200, "application/json", "{\"ok\":true}");
+        });
+    
+    server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String token = request->getHeader("Authorization") ? request->getHeader("Authorization")->value() : "";
+        if (!auth.verifySession(token)) {
+            request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+            return;
+        }
+        
+        String json = "{";
+        json += "\"camera\":" + String(cameraOK ? "true" : "false") + ",";
+        json += "\"audio\":" + String(audioOK ? "true" : "false") + ",";
+        json += "\"psram\":\"" + String(ESP.getFreePsram() / 1024) + "K\",";
+        json += "\"heap\":\"" + String(ESP.getFreeHeap() / 1024) + "K\",";
+        json += "\"temp\":\"" + String((temprature_sens_read() - 32) / 1.8, 0) + "°C\",";
+        json += "\"wifi\":\"" + String(WiFi.RSSI()) + "dBm\"";
+        json += "}";
+        request->send(200, "application/json", json);
+    });
+    
+    server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            JsonDocument doc;
+            deserializeJson(doc, data);
+            
+            preferences.begin("heysalad", false);
+            preferences.putString("ssid", doc["ssid"].as<String>());
+            preferences.putString("password", doc["password"].as<String>());
+            preferences.putBool("configured", true);
+            preferences.end();
+            
+            request->send(200, "application/json", "{\"ok\":true}");
+            delay(1000);
+            ESP.restart();
+        });
+    
+    server.begin();
+    Serial.println("Server started");
+    Serial.printf("Camera: %s | Audio: %s\n", 
+                  cameraOK ? "OK" : "FAIL",
+                  audioOK ? "OK" : "FAIL");
+    Serial.printf("Sessions: %d active\n", auth.getActiveSessionCount());
+    
+    if (!auth.isSetupComplete()) {
+        Serial.println("\n⚠️  SECURITY WARNING ⚠️");
+        Serial.println("Using default password: admin123");
+        Serial.println("Please change password on first login!");
+    }
+}
+
+void loop() {
+    ws.cleanupClients();
+    
+    // Process OpenAI WebSocket if active
+    if (openaiClient.isActive()) {
+        openaiClient.loop();
+    }
+    
+    delay(10);
+}const char* mainHTML = R"rawliteral(<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeySalad</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Figtree',sans-serif;background:white;min-height:100vh;padding:20px}.header{text-align:center;margin-bottom:20px;position:relative}.logo-container{display:inline-block}.logo-container svg{width:200px;height:auto}.tagline{color:#666;font-size:12px;margin-top:8px;letter-spacing:0.5px}.settings-icon{position:absolute;top:0;right:20px;cursor:pointer;font-size:28px;color:#ed4c4c;transition:transform 0.3s}.settings-icon:hover{transform:rotate(90deg)}.logout-btn{position:absolute;top:0;left:20px;padding:8px 16px;background:#dc3545;color:white;border:none;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600}.nav{display:flex;gap:10px;justify-content:center;margin-bottom:20px}.nav button{padding:10px 20px;background:white;border:2px solid #ed4c4c;border-radius:10px;color:#ed4c4c;cursor:pointer;font-weight:600;font-size:14px}.nav button.active{background:#ed4c4c;color:white}.page{display:none}.page.active{display:block}.container{max-width:600px;margin:0 auto;background:white;padding:40px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,0.1)}.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:20px;font-weight:600;background:#f0f0f0;color:#666}.status.calling{background:#d4edda;color:#155724;animation:pulse 1.5s infinite}.status.energy{background:#fff3cd;color:#856404}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}.call-button{width:200px;height:200px;border-radius:50%;border:none;background:linear-gradient(135deg,#28a745 0%,#1e7e34 100%);color:white;font-size:24px;font-weight:700;cursor:pointer;margin:20px auto;display:flex;flex-direction:column;align-items:center;justify-content:center;box-shadow:0 10px 30px rgba(40,167,69,0.4);transition:all 0.3s}.call-button:hover{transform:scale(1.05)}.call-button.active{background:linear-gradient(135deg,#dc3545 0%,#c82333 100%);box-shadow:0 10px 30px rgba(220,53,69,0.4)}.camera-view{text-align:center;margin-top:20px}.camera-view img{max-width:100%;border-radius:15px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}.actions{display:flex;gap:10px;justify-content:center;margin-top:20px;flex-wrap:wrap}.actions button{padding:12px 24px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:600}select{width:100%;padding:12px;border:2px solid #ed4c4c;border-radius:10px;font-size:16px;margin-bottom:15px;font-weight:600;color:#495057;background:white;cursor:pointer}.settings-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}.settings-modal.active{display:flex}.settings-content{background:white;padding:40px;border-radius:20px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto}.settings-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}.close-btn{font-size:32px;cursor:pointer;color:#666;line-height:1}.close-btn:hover{color:#ed4c4c}.form-group{margin-bottom:20px}label{display:block;margin-bottom:8px;font-weight:600;color:#495057}input{width:100%;padding:12px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px}input:focus{outline:none;border-color:#ed4c4c}.save-btn{width:100%;padding:15px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:600;margin-top:20px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-top:20px}.metric-card{background:#f8f9fa;padding:15px;border-radius:10px;text-align:center}.metric-label{font-size:12px;color:#6c757d;margin-bottom:5px}.metric-value{font-size:24px;font-weight:700;color:#ed4c4c}.energy-badge{display:inline-block;padding:4px 12px;background:#28a745;color:white;border-radius:20px;font-size:11px;font-weight:600;margin-left:8px}h2{text-align:center;color:#ed4c4c;margin-bottom:20px;font-size:28px}h3{color:#495057;margin-bottom:15px;margin-top:25px;font-size:18px}.info-text{background:#e7f3ff;border-left:4px solid:#2196f3;padding:12px;border-radius:8px;margin:15px 0;font-size:14px;color:#1565c0}</style></head><body>
+<div class="header"><button class="logout-btn" onclick="logout()">Logout</button><div class="logo-container" id="logoContainer"></div><div class="tagline">HeySalad ® Food Assistant</div><div class="settings-icon" onclick="openSettings()">⚙️</div></div>
+<div class="nav"><button onclick="showPage('call')" class="active" id="nav-call">Call</button><button onclick="showPage('camera')" id="nav-camera">Camera</button></div>
+<div class="page active" id="page-call"><div class="container"><h2>AI Assistant Call</h2><select id="provider"><option value="openai">OpenAI Realtime<span class="energy-badge">♻️ Energy Smart</span></option><option value="elevenlabs">ElevenLabs (Coming Soon)</option><option value="gemini">Google Gemini (Coming Soon)</option><option value="deepseek">DeepSeek (Coming Soon)</option></select><select id="mode"><option value="chef">Chef Mode 👨‍🍳</option><option value="service">Service Mode 🛎️</option><option value="general">General Assistant 💬</option></select><div class="info-text">♻️ <strong>Energy Conscious:</strong> Camera only activates when AI requests to see ingredients. This saves power and helps the environment!</div><div class="status" id="call-status">Select options and tap to start</div><button class="call-button" id="call-btn"><div style="font-size:64px;margin-bottom:10px">📞</div><div id="call-btn-text">Start Call</div></button></div></div>
+<div class="page" id="page-camera"><div class="container"><h2>Camera</h2><div class="camera-view"><img id="cameraImg" src="/capture" style="width:100%"></div><div class="actions"><button onclick="refreshCamera()">Refresh</button></div></div></div>
+<div class="settings-modal" id="settingsModal"><div class="settings-content"><div class="settings-header"><h2 style="margin:0">Settings</h2><span class="close-btn" onclick="closeSettings()">×</span></div><h3>🔐 Change Password</h3><div class="form-group"><label>Current Password</label><input type="password" id="old-password"></div><div class="form-group"><label>New Password</label><input type="password" id="new-password"></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirm-password"></div><button class="save-btn" onclick="changePassword()">🔒 Update Password</button><h3>🔑 API Keys</h3><div class="form-group"><label>OpenAI API Key</label><input type="password" id="openai-key" placeholder="sk-proj-..."></div><div class="form-group"><label>ElevenLabs API Key</label><input type="password" id="elevenlabs-key" placeholder="el_..."></div><div class="form-group"><label>Google Gemini API Key</label><input type="password" id="gemini-key" placeholder="AI..."></div><div class="form-group"><label>DeepSeek API Key</label><input type="password" id="deepseek-key" placeholder="sk-..."></div><button class="save-btn" onclick="saveSettings()">💾 Save Credentials</button><h3>📊 System Status</h3><div class="metric-grid"><div class="metric-card"><div class="metric-label">Camera</div><div class="metric-value" id="status-camera">-</div></div><div class="metric-card"><div class="metric-label">Audio</div><div class="metric-value" id="status-audio">-</div></div><div class="metric-card"><div class="metric-label">PSRAM</div><div class="metric-value" id="status-psram">-</div></div><div class="metric-card"><div class="metric-label">Heap Free</div><div class="metric-value" id="status-heap">-</div></div><div class="metric-card"><div class="metric-label">Temperature</div><div class="metric-value" id="status-temp">-</div></div><div class="metric-card"><div class="metric-label">WiFi Signal</div><div class="metric-value" id="status-wifi">-</div></div></div></div></div>
+<script>
+let sessionToken=localStorage.getItem('heysalad_token')||'';
+fetch('/logo.svg').then(r=>r.text()).then(svg=>document.getElementById('logoContainer').innerHTML=svg);
+let ws;let isInCall=false;
+const callBtn=document.getElementById('call-btn');const callBtnText=document.getElementById('call-btn-text');
+function showPage(page){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));document.getElementById('page-'+page).classList.add('active');document.getElementById('nav-'+page).classList.add('active')}
+function openSettings(){document.getElementById('settingsModal').classList.add('active');loadSettings();updateMetrics()}
+function closeSettings(){document.getElementById('settingsModal').classList.remove('active')}
+function logout(){localStorage.removeItem('heysalad_token');fetch('/logout',{method:'POST',headers:{'Authorization':sessionToken}}).then(()=>window.location.reload())}
+function changePassword(){const oldPwd=document.getElementById('old-password').value;const newPwd=document.getElementById('new-password').value;const confirmPwd=document.getElementById('confirm-password').value;if(newPwd!==confirmPwd){alert('❌ Passwords do not match');return}if(newPwd.length<6){alert('❌ Password must be at least 6 characters');return}fetch('/change_password',{method:'POST',headers:{'Content-Type':'application/json','Authorization':sessionToken},body:JSON.stringify({old:oldPwd,new:newPwd})}).then(r=>r.json()).then(data=>{if(data.ok){alert('✅ Password changed successfully! Please login again.');logout()}else{alert('❌ '+data.error)}})}
+function loadSettings(){fetch('/get_keys',{headers:{'Authorization':sessionToken}}).then(r=>r.json()).then(data=>{document.getElementById('openai-key').value=data.openai||'';document.getElementById('elevenlabs-key').value=data.elevenlabs||'';document.getElementById('gemini-key').value=data.gemini||'';document.getElementById('deepseek-key').value=data.deepseek||''})}
+function saveSettings(){const keys={openai:document.getElementById('openai-key').value,elevenlabs:document.getElementById('elevenlabs-key').value,gemini:document.getElementById('gemini-key').value,deepseek:document.getElementById('deepseek-key').value};fetch('/save_keys',{method:'POST',headers:{'Content-Type':'application/json','Authorization':sessionToken},body:JSON.stringify(keys)}).then(r=>r.json()).then(data=>{alert('✅ Credentials saved!');closeSettings()})}
+function updateMetrics(){fetch('/metrics',{headers:{'Authorization':sessionToken}}).then(r=>r.json()).then(data=>{document.getElementById('status-camera').textContent=data.camera?'✓':'✗';document.getElementById('status-audio').textContent=data.audio?'✓':'✗';document.getElementById('status-psram').textContent=data.psram;document.getElementById('status-heap').textContent=data.heap;document.getElementById('status-temp').textContent=data.temp;document.getElementById('status-wifi').textContent=data.wifi})}
+function connect(){ws=new WebSocket('ws://'+location.hostname+'/ws');ws.onopen=()=>{console.log('Connected');ws.send(JSON.stringify({type:'auth',token:sessionToken}))};ws.onmessage=(event)=>{const data=JSON.parse(event.data);if(data.type==='call_status'){document.getElementById('call-status').textContent=data.text;document.getElementById('call-status').className='status '+(data.calling?'calling':'')+(data.energy?' energy':'')}};ws.onclose=()=>setTimeout(connect,2000)}
+callBtn.onclick=(e)=>{e.preventDefault();const provider=document.getElementById('provider').value;const mode=document.getElementById('mode').value;if(provider!=='openai'){alert('⚠️ Only OpenAI Realtime is currently available');return}if(!isInCall){isInCall=true;callBtn.classList.add('active');callBtnText.textContent='End Call';ws.send(JSON.stringify({type:'call_start',provider:provider,mode:mode}))}else{isInCall=false;callBtn.classList.remove('active');callBtnText.textContent='Start Call';ws.send(JSON.stringify({type:'call_end'}))}};
+function refreshCamera(){document.getElementById('cameraImg').src='/capture?'+Date.now()+'&token='+sessionToken}
+setInterval(updateMetrics,5000);
+connect()
+</script></body></html>)rawliteral";#include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
@@ -10,39 +273,60 @@
 #include "camera.h"
 #include "logo.h"
 #include "audio.h"
+#include "auth.h"
+#include "openai_realtime.h"
 
 Preferences preferences;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+AuthManager auth;
+OpenAIRealtime openaiClient;
 
 String wifiSSID = "";
 String wifiPassword = "";
+String openaiKey = "";
+String elevenlabsKey = "";
+String geminiKey = "";
+String deepseekKey = "";
 bool isConfigured = false;
 bool cameraOK = false;
 bool audioOK = false;
 
 const char* mainHTML = R"rawliteral(<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeySalad</title>
-<style>@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Figtree',sans-serif;background:white;min-height:100vh;padding:20px}.header{text-align:center;margin-bottom:20px}.logo-container{display:inline-block}.logo-container svg{width:200px;height:auto}.tagline{color:#666;font-size:12px;margin-top:8px;letter-spacing:0.5px}.nav{display:flex;gap:10px;justify-content:center;margin-bottom:20px}.nav button{padding:10px 20px;background:white;border:2px solid #ed4c4c;border-radius:10px;color:#ed4c4c;cursor:pointer;font-weight:600;font-size:14px}.nav button.active{background:#ed4c4c;color:white}.page{display:none}.page.active{display:block}.container{max-width:600px;margin:0 auto;background:white;padding:40px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,0.1)}.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:20px;font-weight:600;background:#f0f0f0;color:#666}.status.listening{background:#d4edda;color:#155724;animation:pulse 1.5s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}.talk-button{width:200px;height:200px;border-radius:50%;border:none;background:linear-gradient(135deg,#ed4c4c 0%,#d43939 100%);color:white;font-size:24px;font-weight:700;cursor:pointer;margin:20px auto;display:flex;flex-direction:column;align-items:center;justify-content:center;box-shadow:0 10px 30px rgba(237,76,76,0.4)}.talk-button:active{transform:scale(0.95)}.talk-button.active{background:linear-gradient(135deg,#28a745 0%,#1e7e34 100%)}.camera-view{text-align:center;margin-top:20px}.camera-view img{max-width:100%;border-radius:15px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}.actions{display:flex;gap:10px;justify-content:center;margin-top:20px}.actions button{padding:12px 24px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:600}.info-box{padding:15px;background:#f8f9fa;border-radius:10px;margin-bottom:15px}.info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #dee2e6}.info-row:last-child{border-bottom:none}.info-label{font-weight:600;color:#495057}.info-value{color:#6c757d}.status-badge{padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600}.status-ok{background:#d4edda;color:#155724}.status-fail{background:#f8d7da;color:#721c24}h2{text-align:center;color:#ed4c4c;margin-bottom:20px;font-size:28px}</style></head><body>
-<div class="header"><div class="logo-container" id="logoContainer"></div><div class="tagline">HeySalad ® Food AI Assistant</div></div>
-<div class="nav"><button onclick="showPage('home')" class="active" id="nav-home">Voice</button><button onclick="showPage('camera')" id="nav-camera">Camera</button><button onclick="showPage('settings')" id="nav-settings">Settings</button></div>
-<div class="page active" id="page-home"><div class="container"><div class="status" id="status">Ready</div><button class="talk-button" id="btn"><div style="font-size:48px;margin-bottom:10px">🎤</div><div>Hold to Talk</div></button></div></div>
+<style>@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Figtree',sans-serif;background:white;min-height:100vh;padding:20px}.header{text-align:center;margin-bottom:20px;position:relative}.logo-container{display:inline-block}.logo-container svg{width:200px;height:auto}.tagline{color:#666;font-size:12px;margin-top:8px;letter-spacing:0.5px}.settings-icon{position:absolute;top:0;right:20px;cursor:pointer;font-size:28px;color:#ed4c4c;transition:transform 0.3s}.settings-icon:hover{transform:rotate(90deg)}.nav{display:flex;gap:10px;justify-content:center;margin-bottom:20px}.nav button{padding:10px 20px;background:white;border:2px solid #ed4c4c;border-radius:10px;color:#ed4c4c;cursor:pointer;font-weight:600;font-size:14px}.nav button.active{645:#ed4c4c;color:white}.page{display:none}.page.active{display:block}.container{max-width:600px;margin:0 auto;background:white;padding:40px;border-radius:20px;box-shadow:0 10px 40px rgba(0,0,0,0.1)}.status{text-align:center;padding:15px;border-radius:10px;margin-bottom:20px;font-weight:600;background:#f0f0f0;color:#666}.status.calling{background:#d4edda;color:#155724;animation:pulse 1.5s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}.call-button{width:200px;height:200px;border-radius:50%;border:none;background:linear-gradient(135deg,#28a745 0%,#1e7e34 100%);color:white;font-size:24px;font-weight:700;cursor:pointer;margin:20px auto;display:flex;flex-direction:column;align-items:center;justify-content:center;box-shadow:0 10px 30px rgba(40,167,69,0.4);transition:all 0.3s}.call-button:hover{transform:scale(1.05)}.call-button.active{background:linear-gradient(135deg,#dc3545 0%,#c82333 100%);box-shadow:0 10px 30px rgba(220,53,69,0.4)}.camera-view{text-align:center;margin-top:20px}.camera-view img{max-width:100%;border-radius:15px;box-shadow:0 5px 20px rgba(0,0,0,0.1)}.actions{display:flex;gap:10px;justify-content:center;margin-top:20px;flex-wrap:wrap}.actions button{padding:12px 24px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:600}select{width:100%;padding:12px;border:2px solid #ed4c4c;border-radius:10px;font-size:16px;margin-bottom:15px;font-weight:600;color:#495057;background:white;cursor:pointer}.settings-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}.settings-modal.active{display:flex}.settings-content{background:white;padding:40px;border-radius:20px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto}.settings-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}.close-btn{font-size:32px;cursor:pointer;color:#666;line-height:1}.close-btn:hover{color:#ed4c4c}.form-group{margin-bottom:20px}label{display:block;margin-bottom:8px;font-weight:600;color:#495057}input{width:100%;padding:12px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px}input:focus{outline:none;border-color:#ed4c4c}.save-btn{width:100%;padding:15px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:600;margin-top:20px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-top:20px}.metric-card{background:#f8f9fa;padding:15px;border-radius:10px;text-align:center}.metric-label{font-size:12px;color:#6c757d;margin-bottom:5px}.metric-value{font-size:24px;font-weight:700;color:#ed4c4c}h2{text-align:center;color:#ed4c4c;margin-bottom:20px;font-size:28px}h3{color:#495057;margin-bottom:15px;margin-top:25px;font-size:18px}</style></head><body>
+<div class="header"><div class="logo-container" id="logoContainer"></div><div class="tagline">HeySalad ® Food Assistant</div><div class="settings-icon" onclick="openSettings()">⚙️</div></div>
+<div class="nav"><button onclick="showPage('call')" class="active" id="nav-call">Call</button><button onclick="showPage('camera')" id="nav-camera">Camera</button></div>
+<div class="page active" id="page-call"><div class="container"><h2>AI Assistant Call</h2><select id="provider"><option value="openai">OpenAI Realtime</option><option value="elevenlabs">ElevenLabs</option><option value="gemini">Google Gemini</option><option value="deepseek">DeepSeek</option></select><select id="mode"><option value="chef">Chef Mode 👨‍🍳</option><option value="service">Service Mode 🛎️</option><option value="general">General Assistant 💬</option></select><div class="status" id="call-status">Select options and tap to start</div><button class="call-button" id="call-btn"><div style="font-size:64px;margin-bottom:10px">📞</div><div id="call-btn-text">Start Call</div></button></div></div>
 <div class="page" id="page-camera"><div class="container"><h2>Camera</h2><div class="camera-view"><img id="cameraImg" src="/capture" style="width:100%"></div><div class="actions"><button onclick="refreshCamera()">Refresh</button></div></div></div>
-<div class="page" id="page-settings"><div class="container"><h2>Status</h2><div class="info-box"><div class="info-row"><span class="info-label">Camera</span><span class="status-badge" id="cameraStatus">Loading...</span></div><div class="info-row"><span class="info-label">Audio</span><span class="status-badge" id="audioStatus">Loading...</span></div><div class="info-row"><span class="info-label">PSRAM</span><span class="info-value" id="psramStatus">Loading...</span></div><div class="info-row"><span class="info-label">IP</span><span class="info-value" id="wifiIP">Loading...</span></div></div><div class="actions"><button onclick="testAudio()">Test Audio</button></div></div></div>
+<div class="settings-modal" id="settingsModal"><div class="settings-content"><div class="settings-header"><h2 style="margin:0">Settings</h2><span class="close-btn" onclick="closeSettings()">×</span></div><h3>🔑 API Keys</h3><div class="form-group"><label>OpenAI API Key</label><input type="password" id="openai-key" placeholder="sk-proj-..."></div><div class="form-group"><label>ElevenLabs API Key</label><input type="password" id="elevenlabs-key" placeholder="el_..."></div><div class="form-group"><label>Google Gemini API Key</label><input type="password" id="gemini-key" placeholder="AI..."></div><div class="form-group"><label>DeepSeek API Key</label><input type="password" id="deepseek-key" placeholder="sk-..."></div><button class="save-btn" onclick="saveSettings()">💾 Save Credentials</button><h3>📊 System Status</h3><div class="metric-grid"><div class="metric-card"><div class="metric-label">Camera</div><div class="metric-value" id="status-camera">-</div></div><div class="metric-card"><div class="metric-label">Audio</div><div class="metric-value" id="status-audio">-</div></div><div class="metric-card"><div class="metric-label">PSRAM</div><div class="metric-value" id="status-psram">-</div></div><div class="metric-card"><div class="metric-label">Heap Free</div><div class="metric-value" id="status-heap">-</div></div><div class="metric-card"><div class="metric-label">Temperature</div><div class="metric-value" id="status-temp">-</div></div><div class="metric-card"><div class="metric-label">WiFi Signal</div><div class="metric-value" id="status-wifi">-</div></div></div></div></div>
 <script>
 fetch('/logo.svg').then(r=>r.text()).then(svg=>document.getElementById('logoContainer').innerHTML=svg);
-let ws;let isHolding=false;const btn=document.getElementById('btn');
+let ws;let isInCall=false;
+const callBtn=document.getElementById('call-btn');const callBtnText=document.getElementById('call-btn-text');
 function showPage(page){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));document.getElementById('page-'+page).classList.add('active');document.getElementById('nav-'+page).classList.add('active')}
-function connect(){ws=new WebSocket('ws://'+location.hostname+'/ws');ws.onopen=()=>console.log('Connected');ws.onmessage=(event)=>{const data=JSON.parse(event.data);if(data.type==='status'){document.getElementById('status').textContent=data.text;document.getElementById('status').className='status '+(data.listening?'listening':'')}};ws.onclose=()=>setTimeout(connect,2000)}
-btn.onmousedown=btn.ontouchstart=(e)=>{e.preventDefault();if(isHolding)return;isHolding=true;btn.classList.add('active');ws.send(JSON.stringify({type:'start'}))};
-btn.onmouseup=btn.ontouchend=(e)=>{e.preventDefault();if(!isHolding)return;isHolding=false;btn.classList.remove('active');ws.send(JSON.stringify({type:'stop'}))};
+function openSettings(){document.getElementById('settingsModal').classList.add('active');loadSettings();updateMetrics()}
+function closeSettings(){document.getElementById('settingsModal').classList.remove('active')}
+function loadSettings(){fetch('/get_keys').then(r=>r.json()).then(data=>{document.getElementById('openai-key').value=data.openai||'';document.getElementById('elevenlabs-key').value=data.elevenlabs||'';document.getElementById('gemini-key').value=data.gemini||'';document.getElementById('deepseek-key').value=data.deepseek||''})}
+function saveSettings(){const keys={openai:document.getElementById('openai-key').value,elevenlabs:document.getElementById('elevenlabs-key').value,gemini:document.getElementById('gemini-key').value,deepseek:document.getElementById('deepseek-key').value};fetch('/save_keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(keys)}).then(r=>r.json()).then(data=>{alert('✅ Credentials saved!');closeSettings()})}
+function updateMetrics(){fetch('/metrics').then(r=>r.json()).then(data=>{document.getElementById('status-camera').textContent=data.camera?'✓':'✗';document.getElementById('status-audio').textContent=data.audio?'✓':'✗';document.getElementById('status-psram').textContent=data.psram;document.getElementById('status-heap').textContent=data.heap;document.getElementById('status-temp').textContent=data.temp;document.getElementById('status-wifi').textContent=data.wifi})}
+function connect(){ws=new WebSocket('ws://'+location.hostname+'/ws');ws.onopen=()=>console.log('Connected');ws.onmessage=(event)=>{const data=JSON.parse(event.data);if(data.type==='call_status'){document.getElementById('call-status').textContent=data.text;document.getElementById('call-status').className='status '+(data.calling?'calling':'')}};ws.onclose=()=>setTimeout(connect,2000)}
+callBtn.onclick=(e)=>{e.preventDefault();const provider=document.getElementById('provider').value;const mode=document.getElementById('mode').value;if(!isInCall){isInCall=true;callBtn.classList.add('active');callBtnText.textContent='End Call';ws.send(JSON.stringify({type:'call_start',provider:provider,mode:mode}))}else{isInCall=false;callBtn.classList.remove('active');callBtnText.textContent='Start Call';ws.send(JSON.stringify({type:'call_end'}))}};
 function refreshCamera(){document.getElementById('cameraImg').src='/capture?'+Date.now()}
-function testAudio(){fetch('/test_audio').then(r=>r.text()).then(msg=>alert(msg))}
-fetch('/status').then(r=>r.json()).then(data=>{document.getElementById('cameraStatus').textContent=data.camera?'OK':'FAIL';document.getElementById('cameraStatus').className='status-badge '+(data.camera?'status-ok':'status-fail');document.getElementById('audioStatus').textContent=data.audio?'OK':'FAIL';document.getElementById('audioStatus').className='status-badge '+(data.audio?'status-ok':'status-fail');document.getElementById('psramStatus').textContent=data.psram;document.getElementById('wifiIP').textContent=data.ip});
+setInterval(updateMetrics,5000);
 connect()
 </script></body></html>)rawliteral";
 
 const char* setupHTML = R"(<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Setup</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#ffd0cd;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh}.container{background:white;padding:40px;border-radius:20px;max-width:500px;width:100%}h1{color:#ed4c4c;text-align:center;margin-bottom:30px}.form-group{margin-bottom:20px}label{display:block;margin-bottom:8px;font-weight:600}input{width:100%;padding:12px;border:2px solid #ffd0cd;border-radius:10px;font-size:16px}button{width:100%;padding:15px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:600}</style></head><body><div class="container"><h1>HeySalad Setup</h1><form id="form"><div class="form-group"><label>WiFi SSID</label><input type="text" id="ssid" required></div><div class="form-group"><label>WiFi Password</label><input type="password" id="password" required></div><button type="submit">Save & Restart</button></form></div><script>document.getElementById('form').onsubmit=async(e)=>{e.preventDefault();await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value})});alert('Saved! Restarting...')}</script></body></html>)";
+
+const char* setupHTML = R"rawliteral(<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeySalad Setup</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Figtree',sans-serif;background:#ffd0cd;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh}.container{background:white;padding:40px;border-radius:20px;max-width:500px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,0.2)}h1{color:#ed4c4c;text-align:center;margin-bottom:30px}.form-group{margin-bottom:20px}label{display:block;margin-bottom:8px;font-weight:600}input{width:100%;padding:12px;border:2px solid #ffd0cd;border-radius:10px;font-size:16px}button{width:100%;padding:15px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:600}</style></head><body>
+<div class="container"><h1>🍅 HeySalad Setup</h1><form id="form"><div class="form-group"><label>WiFi SSID</label><input type="text" id="ssid" required></div><div class="form-group"><label>WiFi Password</label><input type="password" id="password" required></div><button type="submit">Save & Restart</button></form></div>
+<script>document.getElementById('form').onsubmit=async(e)=>{e.preventDefault();await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value})});alert('Saved! Restarting...');setTimeout(()=>window.location.reload(),2000)}</script></body></html>)rawliteral";
+
+// WebSocket client sessions
+std::map<uint32_t, String> wsClientTokens;
 
 void onWSEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, 
                AwsEventType type, void *arg, uint8_t *data, size_t len) {
@@ -51,23 +335,60 @@ void onWSEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
         deserializeJson(doc, data);
         String msgType = doc["type"].as<String>();
         
-        if (msgType == "start") {
-            digitalWrite(LED_GPIO_NUM, HIGH);
-            Serial.println("Voice started");
-            client->text("{\"type\":\"status\",\"text\":\"Listening...\",\"listening\":true}");
-            
-            // TODO: Start recording audio here
-            
-        } else if (msgType == "stop") {
-            digitalWrite(LED_GPIO_NUM, LOW);
-            Serial.println("Voice stopped");
-            client->text("{\"type\":\"status\",\"text\":\"Processing...\",\"listening\":false}");
-            
-            // TODO: Stop recording and process audio here
-            
-            delay(1000);
-            client->text("{\"type\":\"status\",\"text\":\"Ready\",\"listening\":false}");
+        // Authentication
+        if (msgType == "auth") {
+            String token = doc["token"].as<String>();
+            if (auth.verifySession(token)) {
+                wsClientTokens[client->id()] = token;
+                Serial.printf("[WS] Client %u authenticated\n", client->id());
+            } else {
+                client->text("{\"type\":\"error\",\"message\":\"Invalid session\"}");
+                client->close();
+            }
+            return;
         }
+        
+        // Check if client is authenticated
+        if (wsClientTokens.find(client->id()) == wsClientTokens.end()) {
+            client->text("{\"type\":\"error\",\"message\":\"Not authenticated\"}");
+            return;
+        }
+        
+        if (msgType == "call_start") {
+            String provider = doc["provider"].as<String>();
+            String mode = doc["mode"].as<String>();
+            digitalWrite(LED_GPIO_NUM, HIGH);
+            Serial.printf("[Call] Started - Provider: %s, Mode: %s\n", provider.c_str(), mode.c_str());
+            
+            client->text("{\"type\":\"call_status\",\"text\":\"Connecting to " + provider + "...\",\"calling\":true}");
+            
+            if (provider == "openai") {
+                if (openaiClient.connect(openaiKey, mode)) {
+                    client->text("{\"type\":\"call_status\",\"text\":\"Connected! Start speaking...\",\"calling\":true,\"energy\":true}");
+                    openaiClient.startRecording();
+                } else {
+                    client->text("{\"type\":\"call_status\",\"text\":\"Connection failed. Check API key.\",\"calling\":false}");
+                    digitalWrite(LED_GPIO_NUM, LOW);
+                }
+            }
+            
+        } else if (msgType == "call_end") {
+            digitalWrite(LED_GPIO_NUM, LOW);
+            Serial.println("[Call] Ended");
+            
+            if (openaiClient.isActive()) {
+                openaiClient.stopRecording();
+                delay(500);
+                openaiClient.disconnect();
+            }
+            
+            client->text("{\"type\":\"call_status\",\"text\":\"Call ended\",\"calling\":false}");
+            delay(1000);
+            client->text("{\"type\":\"call_status\",\"text\":\"Select options and tap to start\",\"calling\":false}");
+        }
+    } else if (type == WS_EVT_DISCONNECT) {
+        wsClientTokens.erase(client->id());
+        Serial.printf("[WS] Client %u disconnected\n", client->id());
     }
 }
 
@@ -81,6 +402,10 @@ void setup() {
     preferences.begin("heysalad", true);
     wifiSSID = preferences.getString("ssid", "");
     wifiPassword = preferences.getString("password", "");
+    openaiKey = preferences.getString("openai", "");
+    elevenlabsKey = preferences.getString("elevenlabs", "");
+    geminiKey = preferences.getString("gemini", "");
+    deepseekKey = preferences.getString("deepseek", "");
     isConfigured = preferences.getBool("configured", false);
     preferences.end();
     
@@ -128,17 +453,44 @@ void setup() {
         esp_camera_fb_return(fb);
     });
     
-    server.on("/test_audio", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(200, "text/plain", "Testing audio... Check serial monitor");
-        testAudioLoopback(3);  // 3 second test
+    server.on("/get_keys", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = "{";
+        json += "\"openai\":\"" + openaiKey + "\",";
+        json += "\"elevenlabs\":\"" + elevenlabsKey + "\",";
+        json += "\"gemini\":\"" + geminiKey + "\",";
+        json += "\"deepseek\":\"" + deepseekKey + "\"";
+        json += "}";
+        request->send(200, "application/json", json);
     });
     
-    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    server.on("/save_keys", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            JsonDocument doc;
+            deserializeJson(doc, data);
+            
+            preferences.begin("heysalad", false);
+            preferences.putString("openai", doc["openai"].as<String>());
+            preferences.putString("elevenlabs", doc["elevenlabs"].as<String>());
+            preferences.putString("gemini", doc["gemini"].as<String>());
+            preferences.putString("deepseek", doc["deepseek"].as<String>());
+            preferences.end();
+            
+            openaiKey = doc["openai"].as<String>();
+            elevenlabsKey = doc["elevenlabs"].as<String>();
+            geminiKey = doc["gemini"].as<String>();
+            deepseekKey = doc["deepseek"].as<String>();
+            
+            request->send(200, "application/json", "{\"ok\":true}");
+        });
+    
+    server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
         String json = "{";
         json += "\"camera\":" + String(cameraOK ? "true" : "false") + ",";
         json += "\"audio\":" + String(audioOK ? "true" : "false") + ",";
-        json += "\"psram\":\"" + String(ESP.getFreePsram() / 1024) + " KB\",";
-        json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+        json += "\"psram\":\"" + String(ESP.getFreePsram() / 1024) + "K\",";
+        json += "\"heap\":\"" + String(ESP.getFreeHeap() / 1024) + "K\",";
+        json += "\"temp\":\"" + String((temprature_sens_read() - 32) / 1.8, 0) + "°C\",";
+        json += "\"wifi\":\"" + String(WiFi.RSSI()) + "dBm\"";
         json += "}";
         request->send(200, "application/json", json);
     });
