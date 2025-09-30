@@ -261,7 +261,10 @@ callBtn.onclick=(e)=>{e.preventDefault();const provider=document.getElementById(
 function refreshCamera(){document.getElementById('cameraImg').src='/capture?'+Date.now()+'&token='+sessionToken}
 setInterval(updateMetrics,5000);
 connect()
-</script></body></html>)rawliteral";#include <Arduino.h>
+</script></body></html>)rawliteral";
+
+#include <Arduino.h>
+
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncWebSocket.h>
