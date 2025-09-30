@@ -1,0 +1,4 @@
+me-no-dev/ESPAsyncWebServer @ ^1.2.3
+bblanchon/ArduinoJson @ ^7.0.4
+me-no-dev/AsyncTCP @ ^1.1.1
+espressif/esp32-camera @ ^2.0.4
