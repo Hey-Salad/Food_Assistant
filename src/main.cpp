@@ -1,3 +1,4 @@
+#if 0  // Superseded duplicate implementation retained from origin/main.
 void setup() {
     Serial.begin(115200);
     delay(2000);
@@ -190,7 +191,7 @@ void setup() {
         json += "\"audio\":" + String(audioOK ? "true" : "false") + ",";
         json += "\"psram\":\"" + String(ESP.getFreePsram() / 1024) + "K\",";
         json += "\"heap\":\"" + String(ESP.getFreeHeap() / 1024) + "K\",";
-        json += "\"temp\":\"" + String((temprature_sens_read() - 32) / 1.8, 0) + "°C\",";
+        json += "\"temp\":\"" + String(temperatureRead(), 0) + "°C\",";
         json += "\"wifi\":\"" + String(WiFi.RSSI()) + "dBm\"";
         json += "}";
         request->send(200, "application/json", json);
@@ -263,6 +264,8 @@ setInterval(updateMetrics,5000);
 connect()
 </script></body></html>)rawliteral";
 
+#endif
+
 #include <Arduino.h>
 
 #include <WiFi.h>
@@ -278,12 +281,18 @@ connect()
 #include "audio.h"
 #include "auth.h"
 #include "openai_realtime.h"
+#include "spatial_client.h"
+#include "spatial_protocol.h"
+#include "ble_provisioner.h"
 
 Preferences preferences;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 AuthManager auth;
 OpenAIRealtime openaiClient;
+SallySpatialClient spatialClient;
+SallyBleProvisioner bleProvisioner;
+SemaphoreHandle_t cameraMutex = nullptr;
 
 String wifiSSID = "";
 String wifiPassword = "";
@@ -319,8 +328,6 @@ function refreshCamera(){document.getElementById('cameraImg').src='/capture?'+Da
 setInterval(updateMetrics,5000);
 connect()
 </script></body></html>)rawliteral";
-
-const char* setupHTML = R"(<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Setup</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#ffd0cd;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh}.container{background:white;padding:40px;border-radius:20px;max-width:500px;width:100%}h1{color:#ed4c4c;text-align:center;margin-bottom:30px}.form-group{margin-bottom:20px}label{display:block;margin-bottom:8px;font-weight:600}input{width:100%;padding:12px;border:2px solid #ffd0cd;border-radius:10px;font-size:16px}button{width:100%;padding:15px;background:#ed4c4c;color:white;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:600}</style></head><body><div class="container"><h1>HeySalad Setup</h1><form id="form"><div class="form-group"><label>WiFi SSID</label><input type="text" id="ssid" required></div><div class="form-group"><label>WiFi Password</label><input type="password" id="password" required></div><button type="submit">Save & Restart</button></form></div><script>document.getElementById('form').onsubmit=async(e)=>{e.preventDefault();await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value})});alert('Saved! Restarting...')}</script></body></html>)";
 
 const char* setupHTML = R"rawliteral(<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HeySalad Setup</title>
@@ -429,8 +436,15 @@ void setup() {
         Serial.println("AP: HeySalad-Setup @ 192.168.4.1");
     }
     
+    cameraMutex = xSemaphoreCreateMutex();
     cameraOK = initCamera();
     audioOK = initAudio();
+    if (audioOK) {
+        playBeep(880, 180, 3);
+    }
+    spatialClient.begin(preferences, cameraMutex, cameraOK, audioOK, audioOK);
+    bleProvisioner.begin(preferences, spatialClient.deviceId(), spatialClient.alias(),
+                         cameraOK, audioOK, audioOK);
     
     ws.onEvent(onWSEvent);
     server.addHandler(&ws);
@@ -444,8 +458,13 @@ void setup() {
     });
     
     server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!cameraMutex || xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            request->send(503, "text/plain", "Camera busy");
+            return;
+        }
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
+            xSemaphoreGive(cameraMutex);
             request->send(500, "text/plain", "Camera failed");
             return;
         }
@@ -454,6 +473,7 @@ void setup() {
         );
         request->send(response);
         esp_camera_fb_return(fb);
+        xSemaphoreGive(cameraMutex);
     });
     
     server.on("/get_keys", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -492,7 +512,7 @@ void setup() {
         json += "\"audio\":" + String(audioOK ? "true" : "false") + ",";
         json += "\"psram\":\"" + String(ESP.getFreePsram() / 1024) + "K\",";
         json += "\"heap\":\"" + String(ESP.getFreeHeap() / 1024) + "K\",";
-        json += "\"temp\":\"" + String((temprature_sens_read() - 32) / 1.8, 0) + "°C\",";
+        json += "\"temp\":\"" + String(temperatureRead(), 0) + "°C\",";
         json += "\"wifi\":\"" + String(WiFi.RSSI()) + "dBm\"";
         json += "}";
         request->send(200, "application/json", json);
@@ -500,12 +520,34 @@ void setup() {
     
     server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
         [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            if (isConfigured) {
+                request->send(403, "application/json", "{\"ok\":false,\"error\":\"already_configured\"}");
+                return;
+            }
             JsonDocument doc;
-            deserializeJson(doc, data);
+            if (deserializeJson(doc, data, len)) {
+                request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_json\"}");
+                return;
+            }
+
+            String alias = doc["sally_alias"] | "";
+            String piBaseUrl = SallySpatialProtocol::trimTrailingSlashes(doc["pi_base_url"] | "");
+            String deviceToken = doc["device_token"] | "";
+            alias.trim();
+            deviceToken.trim();
+            if ((!alias.isEmpty() && !SallySpatialProtocol::isValidAlias(alias)) ||
+                (!piBaseUrl.isEmpty() && !piBaseUrl.startsWith("http://") && !piBaseUrl.startsWith("https://")) ||
+                (!deviceToken.isEmpty() && deviceToken.length() < 32)) {
+                request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_spatial_configuration\"}");
+                return;
+            }
             
             preferences.begin("heysalad", false);
             preferences.putString("ssid", doc["ssid"].as<String>());
             preferences.putString("password", doc["password"].as<String>());
+            if (!alias.isEmpty()) preferences.putString("sallyAlias", alias);
+            if (!piBaseUrl.isEmpty()) preferences.putString("piBaseUrl", piBaseUrl);
+            if (!deviceToken.isEmpty()) preferences.putString("deviceToken", deviceToken);
             preferences.putBool("configured", true);
             preferences.end();
             
@@ -523,5 +565,7 @@ void setup() {
 
 void loop() {
     ws.cleanupClients();
+    spatialClient.loop();
+    bleProvisioner.loop();
     delay(10);
 }

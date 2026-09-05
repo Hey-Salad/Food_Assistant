@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <driver/i2s.h>  // Legacy driver - always available in Arduino
+#include <math.h>
 #include "config.h"
 
 // Audio configuration
@@ -14,6 +15,36 @@
 #define SPK_DOUT_PIN      42
 
 bool audioInitialized = false;
+
+void playBeep(uint16_t frequencyHz = 880, uint16_t durationMs = 250, uint8_t repeats = 1) {
+    if (!audioInitialized) {
+        Serial.println("Audio not initialized; skipping beep");
+        return;
+    }
+
+    const size_t sampleCount = (SAMPLE_RATE * durationMs) / 1000;
+    const size_t bufferBytes = sampleCount * sizeof(int16_t);
+    int16_t* buffer = (int16_t*)malloc(bufferBytes);
+    if (!buffer) {
+        Serial.println("Failed to allocate beep buffer");
+        return;
+    }
+
+    const float step = (2.0f * PI * frequencyHz) / SAMPLE_RATE;
+    const int16_t amplitude = 7000;
+    for (size_t i = 0; i < sampleCount; i++) {
+        buffer[i] = (int16_t)(sinf(step * i) * amplitude);
+    }
+
+    for (uint8_t repeat = 0; repeat < repeats; repeat++) {
+        size_t bytes_written = 0;
+        i2s_write(I2S_NUM_1, buffer, bufferBytes, &bytes_written, pdMS_TO_TICKS(durationMs + 100));
+        i2s_zero_dma_buffer(I2S_NUM_1);
+        delay(120);
+    }
+
+    free(buffer);
+}
 
 bool initAudio() {
     Serial.println("Initializing audio...");
