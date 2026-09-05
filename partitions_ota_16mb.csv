@@ -1,0 +1,11 @@
+# huge_app.csv gave one 3MB app slot inside 4MB, leaving 12MB of the flash
+# unused and no room for OTA to land — an update authenticated and then died
+# with a connection reset. Two 6MB slots fit comfortably and leave a large
+# SPIFFS for buffering captures while the door is shut and the radio is boxed in.
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x600000,
+app1,       app,  ota_1,    0x610000,  0x600000,
+spiffs,     data, spiffs,   0xC10000,  0x3E0000,
+coredump,   data, coredump, 0xFF0000,  0x10000,

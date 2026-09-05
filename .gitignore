@@ -35,3 +35,5 @@ __pycache__/
 Thumbs.db
 .Spotlight-V100
 .Trashes
+# Device credentials — never tracked
+include/secrets.h

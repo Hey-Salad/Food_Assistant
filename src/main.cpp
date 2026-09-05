@@ -20,6 +20,18 @@ void setup() {
     isConfigured = preferences.getBool("configured", false);
     preferences.end();
     
+    if (wifiSSID.isEmpty() && strlen(FALLBACK_WIFI_SSID) > 0) {
+        // Provisioning over the portal or BLE still wins; this only saves the
+        // AP dance on a device that has never been set up.
+        wifiSSID = FALLBACK_WIFI_SSID;
+        wifiPassword = FALLBACK_WIFI_PASSWORD;
+        preferences.begin("heysalad", false);
+        preferences.putString("ssid", wifiSSID);
+        preferences.putString("password", wifiPassword);
+        preferences.end();
+        Serial.println("WiFi: using built-in fallback credentials");
+    }
+
     if (!wifiSSID.isEmpty()) {
         WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
         Serial.print("Connecting to WiFi");
@@ -228,6 +240,7 @@ void setup() {
 }
 
 void loop() {
+    if (otaReady) ArduinoOTA.handle();
     ws.cleanupClients();
     
     // Process OpenAI WebSocket if active
@@ -284,6 +297,20 @@ connect()
 #include "spatial_client.h"
 #include "spatial_protocol.h"
 #include "ble_provisioner.h"
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include "secrets.h"
+
+// Night vision. The DFR1154 carries an IR LED here; without it a capture taken
+// after the door shuts is a black frame, because the fridge's own lamp is out.
+#define IR_LED_PIN 47
+#define CAM_OTA_HOSTNAME "heysalad-fridge-cam"
+
+static bool otaReady = false;
+
+static void setIRLED(bool on) {
+  digitalWrite(IR_LED_PIN, on ? HIGH : LOW);
+}
 
 Preferences preferences;
 AsyncWebServer server(80);
@@ -408,6 +435,8 @@ void setup() {
     Serial.println("\n\n=== HeySalad Starting ===");
     
     pinMode(LED_GPIO_NUM, OUTPUT);
+    pinMode(IR_LED_PIN, OUTPUT);
+    setIRLED(false);
     
     preferences.begin("heysalad", true);
     wifiSSID = preferences.getString("ssid", "");
@@ -419,6 +448,18 @@ void setup() {
     isConfigured = preferences.getBool("configured", false);
     preferences.end();
     
+    if (wifiSSID.isEmpty() && strlen(FALLBACK_WIFI_SSID) > 0) {
+        // Provisioning over the portal or BLE still wins; this only saves the
+        // AP dance on a device that has never been set up.
+        wifiSSID = FALLBACK_WIFI_SSID;
+        wifiPassword = FALLBACK_WIFI_PASSWORD;
+        preferences.begin("heysalad", false);
+        preferences.putString("ssid", wifiSSID);
+        preferences.putString("password", wifiPassword);
+        preferences.end();
+        Serial.println("WiFi: using built-in fallback credentials");
+    }
+
     if (!wifiSSID.isEmpty()) {
         WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
         Serial.print("Connecting to WiFi");
@@ -430,6 +471,14 @@ void setup() {
         }
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
+            // Reachable by name, so no DHCP reservation is needed.
+            MDNS.begin(CAM_OTA_HOSTNAME);
+            MDNS.addService("http", "tcp", 80);
+            ArduinoOTA.setHostname(CAM_OTA_HOSTNAME);
+            ArduinoOTA.setPassword(CAM_OTA_PASSWORD);
+            ArduinoOTA.begin();
+            otaReady = true;
+            Serial.printf("OTA: %s.local\n", CAM_OTA_HOSTNAME);
         }
     } else {
         WiFi.softAP("HeySalad-Setup");
@@ -462,18 +511,54 @@ void setup() {
             request->send(503, "text/plain", "Camera busy");
             return;
         }
+        const bool useIR = request->hasParam("ir") &&
+                           request->getParam("ir")->value() != "0";
+        if (useIR) {
+            setIRLED(true);
+            // Auto-exposure is still metered for darkness for a frame or two
+            // after the LED comes on, so drop those rather than return one.
+            delay(120);
+            for (int i = 0; i < 2; i++) {
+                camera_fb_t *stale = esp_camera_fb_get();
+                if (stale) esp_camera_fb_return(stale);
+            }
+        }
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
+            if (useIR) setIRLED(false);
             xSemaphoreGive(cameraMutex);
             request->send(500, "text/plain", "Camera failed");
             return;
         }
-        AsyncWebServerResponse *response = request->beginResponse_P(
-            200, "image/jpeg", fb->buf, fb->len
-        );
-        request->send(response);
+        // The response only REFERENCES this buffer and send() is asynchronous, so
+        // handing back the frame buffer here let the driver reuse it mid-transmit
+        // and every JPEG arrived truncated. Copy into PSRAM, release the camera
+        // immediately so it is not held for the length of a transfer, and free
+        // the copy once the client has actually gone.
+        const size_t len = fb->len;
+        uint8_t *copy = (uint8_t *)ps_malloc(len);
+        if (copy) memcpy(copy, fb->buf, len);
         esp_camera_fb_return(fb);
+        if (useIR) setIRLED(false);
         xSemaphoreGive(cameraMutex);
+
+        if (!copy) {
+            request->send(500, "text/plain", "Out of memory");
+            return;
+        }
+        AsyncWebServerResponse *response = request->beginResponse_P(
+            200, "image/jpeg", copy, len
+        );
+        request->onDisconnect([copy]() { free(copy); });
+        request->send(response);
+    });
+
+    // Lets the IR illuminator be checked on its own, without taking a picture.
+    server.on("/ir", HTTP_GET, [](AsyncWebServerRequest *request) {
+        const bool on = request->hasParam("on") &&
+                        request->getParam("on")->value() != "0";
+        setIRLED(on);
+        request->send(200, "application/json", on ? "{\"ir\":true}" : "{\"ir\":false}");
     });
     
     server.on("/get_keys", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -564,6 +649,7 @@ void setup() {
 }
 
 void loop() {
+    if (otaReady) ArduinoOTA.handle();
     ws.cleanupClients();
     spatialClient.loop();
     bleProvisioner.loop();
