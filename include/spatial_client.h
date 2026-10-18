@@ -6,6 +6,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+struct SallyUplinkResult {
+    int status = -1;
+    int retryAfterSec = -1;
+    bool captureNow = false;
+    bool oversized = false;
+};
+
 class SallySpatialClient {
 public:
     void begin(Preferences& preferences, SemaphoreHandle_t cameraMutex, bool cameraAvailable,
@@ -14,13 +21,16 @@ public:
     bool isConfigured() const;
     const String& deviceId() const;
     const String& alias() const;
+    uint32_t snapshotIntervalSec() const;
 
 private:
-    bool postHeartbeat();
-    bool postFrame();
+    SallyUplinkResult postHeartbeat();
+    SallyUplinkResult postFrame();
     bool beginRequest(class HTTPClient& http, const String& url);
     void addCommonHeaders(class HTTPClient& http);
-    void recordAttempt(bool successful, uint32_t now);
+    void noteResult(const SallyUplinkResult& result, uint32_t now, uint8_t& failures,
+                    uint32_t& retryAfter, uint32_t rateLimitFloorMs);
+    static int readRetryAfter(class HTTPClient& http);
 
     String _deviceId;
     String _alias;
@@ -30,12 +40,18 @@ private:
     bool _cameraAvailable = false;
     bool _microphoneAvailable = false;
     bool _speakerAvailable = false;
+    uint32_t _snapshotIntervalMs = 300000;
     uint32_t _frameSequence = 0;
     uint32_t _droppedFrames = 0;
     uint32_t _lastFrameAttempt = 0;
     uint32_t _lastHeartbeatAttempt = 0;
-    uint32_t _retryAfter = 0;
-    uint8_t _consecutiveFailures = 0;
+    uint32_t _heartbeatRetryAfter = 0;
+    uint32_t _frameRetryAfter = 0;
+    uint8_t _heartbeatFailures = 0;
+    uint8_t _frameFailures = 0;
+    bool _captureNow = false;
+    bool _heartbeatStarted = false;
+    bool _frameStarted = false;
 };
 
 #endif

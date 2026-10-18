@@ -455,9 +455,8 @@ curl -X POST http://[DEVICE_IP]/login \
   -H "Content-Type: application/json" \
   -d '{"password":"yourpassword"}'
 
-# Get API keys status
-curl http://[DEVICE_IP]/get_keys \
-  -H "Authorization: YOUR_SESSION_TOKEN"
+# Model API keys are not stored on the camera. /get_keys and /save_keys
+# are not registered and respond 404.
 ```
 
 ### Debug Commands

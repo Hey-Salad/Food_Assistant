@@ -8,6 +8,7 @@
 #include <driver/i2s.h>
 #include <esp_camera.h>
 #include "config.h"
+#include "tls_roots.h"
 
 // OpenAI Realtime API Configuration
 #define OPENAI_WS_HOST "api.openai.com"
@@ -249,7 +250,8 @@ public:
         String auth = "Authorization: Bearer " + apiKey;
         String protocol = "OpenAI-Beta: realtime=v1";
         
-        wsClient.beginSSL(OPENAI_WS_HOST, OPENAI_WS_PORT, OPENAI_WS_PATH, "", protocol.c_str());
+        wsClient.beginSslWithCA(OPENAI_WS_HOST, OPENAI_WS_PORT, OPENAI_WS_PATH,
+                                SallyTls::kRootCaPem, protocol.c_str());
         wsClient.setExtraHeaders(auth.c_str());
         wsClient.setReconnectInterval(5000);
         
