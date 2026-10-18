@@ -51,11 +51,14 @@ void SallySpatialClient::begin(Preferences& preferences, SemaphoreHandle_t camer
     _snapshotIntervalMs = snapshotSec * 1000UL;
 
     _alias = SallySpatialProtocol::isValidAlias(configuredAlias) ? configuredAlias : _deviceId;
+    const std::string host = SallyPolicy::baseHost(std::string(_piBaseUrl.c_str()));
     Serial.printf("Sally Spatial device: %s (alias: %s)\n", _deviceId.c_str(), _alias.c_str());
-    Serial.printf("Sally Spatial uplink: %s, snapshot every %u s, heartbeat every %u s\n",
+    Serial.printf("Sally Spatial uplink: %s, base host %s, snapshot every %u s, heartbeat every %u s\n",
                   isConfigured() ? "configured" : "disabled",
+                  host.empty() ? "(none)" : host.c_str(),
                   snapshotIntervalSec(),
                   SallySpatialProtocol::HEARTBEAT_INTERVAL_MS / 1000);
+    Serial.println("Sally Spatial heartbeat: no response yet");
 }
 
 bool SallySpatialClient::isConfigured() const {
@@ -212,6 +215,7 @@ void SallySpatialClient::loop() {
         const SallyUplinkResult result = postHeartbeat();
         noteResult(result, millis(), _heartbeatFailures, _heartbeatRetryAfter,
                    SallyPolicy::kHeartbeatRateLimitFloorMs);
+        Serial.printf("Sally Spatial heartbeat: HTTP %d\n", result.status);
         if (result.captureNow && result.status >= 200 && result.status < 300) _captureNow = true;
     }
 

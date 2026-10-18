@@ -146,6 +146,46 @@ inline bool isHexDigit(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+// Last six hex digits of the hardware id, so two boards never share a name.
+inline std::string lastHwIdHex6(const std::string& hwId) {
+    std::string hex;
+    for (char c : hwId) {
+        if (!isHexDigit(c)) continue;
+        hex.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (hex.size() >= 6) return hex.substr(hex.size() - 6);
+    if (!hex.empty()) return hex;
+    return "camera";
+}
+
+// mDNS and OTA label, without ".local". A provisioned alias wins. Otherwise
+// the label is sally- plus the last six hex digits of the hardware id.
+inline std::string mdnsHostname(const std::string& alias, const std::string& hwId) {
+    const std::string trimmedAlias = trim(alias);
+    const std::string trimmedId = trim(hwId);
+    const bool useAlias = isValidAlias(trimmedAlias) && trimmedAlias != trimmedId;
+    std::string host = std::string("sally-") + (useAlias ? trimmedAlias : lastHwIdHex6(trimmedId));
+    if (host.size() > 63) host.resize(63);
+    while (!host.empty() && host.back() == '-') host.pop_back();
+    if (host.size() < 2) host = std::string("sally-") + lastHwIdHex6(trimmedId);
+    return host;
+}
+
+// Scheme, userinfo, path, and query stripped. The device token is never part
+// of this string.
+inline std::string baseHost(const std::string& url) {
+    std::string value = trim(url);
+    size_t start = 0;
+    if (value.compare(0, 8, "https://") == 0) start = 8;
+    else if (value.compare(0, 7, "http://") == 0) start = 7;
+    const size_t stop = value.find_first_of("/?#", start);
+    std::string host = value.substr(start, (stop == std::string::npos ? value.size() : stop) - start);
+    const size_t at = host.find('@');
+    if (at != std::string::npos) host = host.substr(at + 1);
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    return host;
+}
+
 // Exactly 32 bytes of hex. Shorter opaque strings are not sally-api device tokens.
 inline bool isDeviceToken(const std::string& token) {
     if (token.size() != kDeviceTokenHexChars) return false;

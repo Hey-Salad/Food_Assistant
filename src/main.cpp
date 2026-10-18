@@ -305,7 +305,6 @@ connect()
 // Night vision. The DFR1154 carries an IR LED here; without it a capture taken
 // after the door shuts is a black frame, because the fridge's own lamp is out.
 #define IR_LED_PIN 47
-#define CAM_OTA_HOSTNAME "heysalad-fridge-cam"
 
 static bool otaReady = false;
 
@@ -437,6 +436,7 @@ void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println("\n\n=== HeySalad Starting ===");
+    Serial.printf("Firmware: %s\n", SallySpatialProtocol::FIRMWARE_VERSION);
     
     pinMode(LED_GPIO_NUM, OUTPUT);
     pinMode(IR_LED_PIN, OUTPUT);
@@ -484,14 +484,6 @@ void setup() {
         }
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
-            // Reachable by name, so no DHCP reservation is needed.
-            MDNS.begin(CAM_OTA_HOSTNAME);
-            MDNS.addService("http", "tcp", 80);
-            ArduinoOTA.setHostname(CAM_OTA_HOSTNAME);
-            ArduinoOTA.setPassword(CAM_OTA_PASSWORD);
-            ArduinoOTA.begin();
-            otaReady = true;
-            Serial.printf("OTA: %s.local\n", CAM_OTA_HOSTNAME);
         }
     } else {
         WiFi.softAP("HeySalad-Setup");
@@ -506,6 +498,18 @@ void setup() {
     }
     spatialClient.begin(preferences, cameraMutex, cameraOK, audioOK, audioOK);
     cloudProvisioned = spatialClient.isConfigured();
+    const std::string mdnsName = SallyPolicy::mdnsHostname(
+        std::string(spatialClient.alias().c_str()), std::string(spatialClient.deviceId().c_str()));
+    Serial.printf("mDNS: %s.local\n", mdnsName.c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        MDNS.begin(mdnsName.c_str());
+        MDNS.addService("http", "tcp", 80);
+        ArduinoOTA.setHostname(mdnsName.c_str());
+        ArduinoOTA.setPassword(CAM_OTA_PASSWORD);
+        ArduinoOTA.begin();
+        otaReady = true;
+        Serial.printf("OTA: %s.local\n", mdnsName.c_str());
+    }
     bleProvisioner.begin(preferences, spatialClient.deviceId(), spatialClient.alias(),
                          cameraOK, audioOK, audioOK);
     

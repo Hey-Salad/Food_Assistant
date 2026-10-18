@@ -23,6 +23,24 @@ int main() {
 
     expect(kDefaultSnapshotIntervalSec == 300, "default snapshot is 5 minutes");
     expect(kHeartbeatIntervalMs == 15000, "heartbeat stays at 15s");
+    expect(mdnsHostname("fridge-2", "sally-a8c12904a7ac") == "sally-fridge-2",
+           "alias becomes the mDNS name");
+    expect(mdnsHostname("", "sally-a8c12904a7ac") == "sally-04a7ac",
+           "missing alias uses the last six hardware digits");
+    expect(mdnsHostname("sally-a8c12904a7ac", "sally-a8c12904a7ac") == "sally-04a7ac",
+           "hardware id used as alias still uses the last six digits");
+    expect(mdnsHostname("Fridge", "sally-bbbbccddeeff") == "sally-ddeeff",
+           "invalid alias falls back to the hardware id");
+    expect(mdnsHostname("cam-a", "sally-111111111111") != mdnsHostname("cam-b", "sally-222222222222"),
+           "two aliases do not share a hostname");
+    expect(baseHost("https://sally-api-dev.heysalad-o.workers.dev/device") ==
+               "sally-api-dev.heysalad-o.workers.dev",
+           "dev base host drops the /device path");
+    expect(baseHost("http://192.168.1.20:8080/v1") == "192.168.1.20:8080",
+           "old base keeps host and port");
+    expect(baseHost("https://user:secret-token@old.example/device?token=abc") == "old.example",
+           "base host omits userinfo and query");
+    expect(baseHost("  ") == "", "blank base has no host");
     expect(kBootButtonGpio == 0, "DFR1154 BOOT is GPIO0");
     expect(kUnlockHoldMs == 5000, "unlock hold is 5s");
     expect(kFactoryResetHoldMs == 12000, "factory reset hold is 12s");
