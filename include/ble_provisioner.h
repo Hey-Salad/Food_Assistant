@@ -21,6 +21,9 @@ private:
     void provisionJson(const String& json);
     void applyProvisioning(const struct SallyBleProvisioningData& data);
     bool provisioningAllowed() const;
+    void pollButton();
+    void unlockFromButton();
+    void factoryReset();
 
     Preferences* _preferences = nullptr;
     NimBLECharacteristic* _statusCharacteristic = nullptr;
@@ -30,9 +33,13 @@ private:
     bool _microphoneAvailable = false;
     bool _speakerAvailable = false;
     bool _locked = false;
+    bool _wifiConfigured = false;
+    bool _storedLock = false;
     bool _restartPending = false;
+    bool _factoryResetStarted = false;
     uint32_t _restartAt = 0;
     uint32_t _windowStartedAt = 0;
+    uint32_t _buttonDownSince = 0;
 };
 
 #endif

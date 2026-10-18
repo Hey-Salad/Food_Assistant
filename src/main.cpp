@@ -296,6 +296,7 @@ connect()
 #include "openai_realtime.h"
 #include "spatial_client.h"
 #include "spatial_protocol.h"
+#include "sally_policy.h"
 #include "ble_provisioner.h"
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
@@ -304,7 +305,6 @@ connect()
 // Night vision. The DFR1154 carries an IR LED here; without it a capture taken
 // after the door shuts is a black frame, because the fridge's own lamp is out.
 #define IR_LED_PIN 47
-#define CAM_OTA_HOSTNAME "heysalad-fridge-cam"
 
 static bool otaReady = false;
 
@@ -323,11 +323,9 @@ SemaphoreHandle_t cameraMutex = nullptr;
 
 String wifiSSID = "";
 String wifiPassword = "";
-String openaiKey = "";
-String elevenlabsKey = "";
-String geminiKey = "";
-String deepseekKey = "";
+String adminToken = "";
 bool isConfigured = false;
+bool cloudProvisioned = false;
 bool cameraOK = false;
 bool audioOK = false;
 
@@ -337,21 +335,18 @@ const char* mainHTML = R"rawliteral(<!DOCTYPE html>
 <div class="header"><div class="logo-container" id="logoContainer"></div><div class="tagline">HeySalad ® Food Assistant</div><div class="settings-icon" onclick="openSettings()">⚙️</div></div>
 <div class="nav"><button onclick="showPage('call')" class="active" id="nav-call">Call</button><button onclick="showPage('camera')" id="nav-camera">Camera</button></div>
 <div class="page active" id="page-call"><div class="container"><h2>AI Assistant Call</h2><select id="provider"><option value="openai">OpenAI Realtime</option><option value="elevenlabs">ElevenLabs</option><option value="gemini">Google Gemini</option><option value="deepseek">DeepSeek</option></select><select id="mode"><option value="chef">Chef Mode 👨‍🍳</option><option value="service">Service Mode 🛎️</option><option value="general">General Assistant 💬</option></select><div class="status" id="call-status">Select options and tap to start</div><button class="call-button" id="call-btn"><div style="font-size:64px;margin-bottom:10px">📞</div><div id="call-btn-text">Start Call</div></button></div></div>
-<div class="page" id="page-camera"><div class="container"><h2>Camera</h2><div class="camera-view"><img id="cameraImg" src="/capture" style="width:100%"></div><div class="actions"><button onclick="refreshCamera()">Refresh</button></div></div></div>
-<div class="settings-modal" id="settingsModal"><div class="settings-content"><div class="settings-header"><h2 style="margin:0">Settings</h2><span class="close-btn" onclick="closeSettings()">×</span></div><h3>🔑 API Keys</h3><div class="form-group"><label>OpenAI API Key</label><input type="password" id="openai-key" placeholder="sk-proj-..."></div><div class="form-group"><label>ElevenLabs API Key</label><input type="password" id="elevenlabs-key" placeholder="el_..."></div><div class="form-group"><label>Google Gemini API Key</label><input type="password" id="gemini-key" placeholder="AI..."></div><div class="form-group"><label>DeepSeek API Key</label><input type="password" id="deepseek-key" placeholder="sk-..."></div><button class="save-btn" onclick="saveSettings()">💾 Save Credentials</button><h3>📊 System Status</h3><div class="metric-grid"><div class="metric-card"><div class="metric-label">Camera</div><div class="metric-value" id="status-camera">-</div></div><div class="metric-card"><div class="metric-label">Audio</div><div class="metric-value" id="status-audio">-</div></div><div class="metric-card"><div class="metric-label">PSRAM</div><div class="metric-value" id="status-psram">-</div></div><div class="metric-card"><div class="metric-label">Heap Free</div><div class="metric-value" id="status-heap">-</div></div><div class="metric-card"><div class="metric-label">Temperature</div><div class="metric-value" id="status-temp">-</div></div><div class="metric-card"><div class="metric-label">WiFi Signal</div><div class="metric-value" id="status-wifi">-</div></div></div></div></div>
+<div class="page" id="page-camera"><div class="container"><h2>Camera</h2><p>Snapshots upload to Sally. This camera does not serve an open capture URL or store model API keys.</p></div></div>
+<div class="settings-modal" id="settingsModal"><div class="settings-content"><div class="settings-header"><h2 style="margin:0">Settings</h2><span class="close-btn" onclick="closeSettings()">×</span></div><h3>Model keys</h3><p>OpenAI, ElevenLabs, Gemini, and DeepSeek keys are not stored on this camera. Inference runs server-side through Sally.</p><h3>📊 System Status</h3><div class="metric-grid"><div class="metric-card"><div class="metric-label">Camera</div><div class="metric-value" id="status-camera">-</div></div><div class="metric-card"><div class="metric-label">Audio</div><div class="metric-value" id="status-audio">-</div></div><div class="metric-card"><div class="metric-label">PSRAM</div><div class="metric-value" id="status-psram">-</div></div><div class="metric-card"><div class="metric-label">Heap Free</div><div class="metric-value" id="status-heap">-</div></div><div class="metric-card"><div class="metric-label">Temperature</div><div class="metric-value" id="status-temp">-</div></div><div class="metric-card"><div class="metric-label">WiFi Signal</div><div class="metric-value" id="status-wifi">-</div></div></div></div></div>
 <script>
 fetch('/logo.svg').then(r=>r.text()).then(svg=>document.getElementById('logoContainer').innerHTML=svg);
 let ws;let isInCall=false;
 const callBtn=document.getElementById('call-btn');const callBtnText=document.getElementById('call-btn-text');
 function showPage(page){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));document.getElementById('page-'+page).classList.add('active');document.getElementById('nav-'+page).classList.add('active')}
-function openSettings(){document.getElementById('settingsModal').classList.add('active');loadSettings();updateMetrics()}
+function openSettings(){document.getElementById('settingsModal').classList.add('active');updateMetrics()}
 function closeSettings(){document.getElementById('settingsModal').classList.remove('active')}
-function loadSettings(){fetch('/get_keys').then(r=>r.json()).then(data=>{document.getElementById('openai-key').value=data.openai||'';document.getElementById('elevenlabs-key').value=data.elevenlabs||'';document.getElementById('gemini-key').value=data.gemini||'';document.getElementById('deepseek-key').value=data.deepseek||''})}
-function saveSettings(){const keys={openai:document.getElementById('openai-key').value,elevenlabs:document.getElementById('elevenlabs-key').value,gemini:document.getElementById('gemini-key').value,deepseek:document.getElementById('deepseek-key').value};fetch('/save_keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(keys)}).then(r=>r.json()).then(data=>{alert('✅ Credentials saved!');closeSettings()})}
 function updateMetrics(){fetch('/metrics').then(r=>r.json()).then(data=>{document.getElementById('status-camera').textContent=data.camera?'✓':'✗';document.getElementById('status-audio').textContent=data.audio?'✓':'✗';document.getElementById('status-psram').textContent=data.psram;document.getElementById('status-heap').textContent=data.heap;document.getElementById('status-temp').textContent=data.temp;document.getElementById('status-wifi').textContent=data.wifi})}
 function connect(){ws=new WebSocket('ws://'+location.hostname+'/ws');ws.onopen=()=>console.log('Connected');ws.onmessage=(event)=>{const data=JSON.parse(event.data);if(data.type==='call_status'){document.getElementById('call-status').textContent=data.text;document.getElementById('call-status').className='status '+(data.calling?'calling':'')}};ws.onclose=()=>setTimeout(connect,2000)}
 callBtn.onclick=(e)=>{e.preventDefault();const provider=document.getElementById('provider').value;const mode=document.getElementById('mode').value;if(!isInCall){isInCall=true;callBtn.classList.add('active');callBtnText.textContent='End Call';ws.send(JSON.stringify({type:'call_start',provider:provider,mode:mode}))}else{isInCall=false;callBtn.classList.remove('active');callBtnText.textContent='Start Call';ws.send(JSON.stringify({type:'call_end'}))}};
-function refreshCamera(){document.getElementById('cameraImg').src='/capture?'+Date.now()}
 setInterval(updateMetrics,5000);
 connect()
 </script></body></html>)rawliteral";
@@ -399,14 +394,9 @@ void onWSEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             
             client->text("{\"type\":\"call_status\",\"text\":\"Connecting to " + provider + "...\",\"calling\":true}");
             
-            if (provider == "openai") {
-                if (openaiClient.connect(openaiKey, mode)) {
-                    client->text("{\"type\":\"call_status\",\"text\":\"Connected! Start speaking...\",\"calling\":true,\"energy\":true}");
-                    openaiClient.startRecording();
-                } else {
-                    client->text("{\"type\":\"call_status\",\"text\":\"Connection failed. Check API key.\",\"calling\":false}");
-                    digitalWrite(LED_GPIO_NUM, LOW);
-                }
+            if (provider == "openai" || provider == "elevenlabs" || provider == "gemini" || provider == "deepseek") {
+                client->text("{\"type\":\"call_status\",\"text\":\"Model API keys are not stored on this camera. Voice runs through Sally.\",\"calling\":false}");
+                digitalWrite(LED_GPIO_NUM, LOW);
             }
             
         } else if (msgType == "call_end") {
@@ -429,24 +419,46 @@ void onWSEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     }
 }
 
+static std::string presentedLanToken(AsyncWebServerRequest* request) {
+    String presented;
+    if (request->hasHeader("Authorization")) {
+        presented = request->header("Authorization");
+        if (presented.startsWith("Bearer ")) presented = presented.substring(7);
+        presented.trim();
+    } else if (request->hasParam("token")) {
+        presented = request->getParam("token")->value();
+        presented.trim();
+    }
+    return std::string(presented.c_str());
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println("\n\n=== HeySalad Starting ===");
+    Serial.printf("Firmware: %s\n", SallySpatialProtocol::FIRMWARE_VERSION);
     
     pinMode(LED_GPIO_NUM, OUTPUT);
     pinMode(IR_LED_PIN, OUTPUT);
     setIRLED(false);
     
-    preferences.begin("heysalad", true);
+    preferences.begin("heysalad", false);
+    const char* retiredKeys[] = {"openai", "elevenlabs", "gemini", "deepseek"};
+    bool removedModelKeys = false;
+    for (const char* name : retiredKeys) {
+        if (preferences.isKey(name)) {
+            preferences.remove(name);
+            removedModelKeys = true;
+        }
+    }
     wifiSSID = preferences.getString("ssid", "");
     wifiPassword = preferences.getString("password", "");
-    openaiKey = preferences.getString("openai", "");
-    elevenlabsKey = preferences.getString("elevenlabs", "");
-    geminiKey = preferences.getString("gemini", "");
-    deepseekKey = preferences.getString("deepseek", "");
+    adminToken = preferences.getString("adminToken", "");
     isConfigured = preferences.getBool("configured", false);
     preferences.end();
+    if (removedModelKeys) {
+        Serial.println("Removed stored model API keys. Inference runs server-side via sally-api.");
+    }
     
     if (wifiSSID.isEmpty() && strlen(FALLBACK_WIFI_SSID) > 0) {
         // Provisioning over the portal or BLE still wins; this only saves the
@@ -456,6 +468,7 @@ void setup() {
         preferences.begin("heysalad", false);
         preferences.putString("ssid", wifiSSID);
         preferences.putString("password", wifiPassword);
+        preferences.putBool("bleProvLocked", true);
         preferences.end();
         Serial.println("WiFi: using built-in fallback credentials");
     }
@@ -471,14 +484,6 @@ void setup() {
         }
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
-            // Reachable by name, so no DHCP reservation is needed.
-            MDNS.begin(CAM_OTA_HOSTNAME);
-            MDNS.addService("http", "tcp", 80);
-            ArduinoOTA.setHostname(CAM_OTA_HOSTNAME);
-            ArduinoOTA.setPassword(CAM_OTA_PASSWORD);
-            ArduinoOTA.begin();
-            otaReady = true;
-            Serial.printf("OTA: %s.local\n", CAM_OTA_HOSTNAME);
         }
     } else {
         WiFi.softAP("HeySalad-Setup");
@@ -492,6 +497,19 @@ void setup() {
         playBeep(880, 180, 3);
     }
     spatialClient.begin(preferences, cameraMutex, cameraOK, audioOK, audioOK);
+    cloudProvisioned = spatialClient.isConfigured();
+    const std::string mdnsName = SallyPolicy::mdnsHostname(
+        std::string(spatialClient.alias().c_str()), std::string(spatialClient.deviceId().c_str()));
+    Serial.printf("mDNS: %s.local\n", mdnsName.c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        MDNS.begin(mdnsName.c_str());
+        MDNS.addService("http", "tcp", 80);
+        ArduinoOTA.setHostname(mdnsName.c_str());
+        ArduinoOTA.setPassword(CAM_OTA_PASSWORD);
+        ArduinoOTA.begin();
+        otaReady = true;
+        Serial.printf("OTA: %s.local\n", mdnsName.c_str());
+    }
     bleProvisioner.begin(preferences, spatialClient.deviceId(), spatialClient.alias(),
                          cameraOK, audioOK, audioOK);
     
@@ -507,6 +525,16 @@ void setup() {
     });
     
     server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request) {
+        const SallyPolicy::LanAdminDecision decision = SallyPolicy::lanAdminAccess(
+            cloudProvisioned, std::string(adminToken.c_str()), presentedLanToken(request));
+        if (decision == SallyPolicy::LanAdminDecision::Disabled) {
+            request->send(404, "application/json", "{\"error\":\"disabled\"}");
+            return;
+        }
+        if (decision != SallyPolicy::LanAdminDecision::Allow) {
+            request->send(401, "application/json", "{\"error\":\"unauthorized\"}");
+            return;
+        }
         if (!cameraMutex || xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
             request->send(503, "text/plain", "Camera busy");
             return;
@@ -555,41 +583,21 @@ void setup() {
 
     // Lets the IR illuminator be checked on its own, without taking a picture.
     server.on("/ir", HTTP_GET, [](AsyncWebServerRequest *request) {
+        const SallyPolicy::LanAdminDecision decision = SallyPolicy::lanAdminAccess(
+            cloudProvisioned, std::string(adminToken.c_str()), presentedLanToken(request));
+        if (decision == SallyPolicy::LanAdminDecision::Disabled) {
+            request->send(404, "application/json", "{\"error\":\"disabled\"}");
+            return;
+        }
+        if (decision != SallyPolicy::LanAdminDecision::Allow) {
+            request->send(401, "application/json", "{\"error\":\"unauthorized\"}");
+            return;
+        }
         const bool on = request->hasParam("on") &&
                         request->getParam("on")->value() != "0";
         setIRLED(on);
         request->send(200, "application/json", on ? "{\"ir\":true}" : "{\"ir\":false}");
     });
-    
-    server.on("/get_keys", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String json = "{";
-        json += "\"openai\":\"" + openaiKey + "\",";
-        json += "\"elevenlabs\":\"" + elevenlabsKey + "\",";
-        json += "\"gemini\":\"" + geminiKey + "\",";
-        json += "\"deepseek\":\"" + deepseekKey + "\"";
-        json += "}";
-        request->send(200, "application/json", json);
-    });
-    
-    server.on("/save_keys", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
-        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-            JsonDocument doc;
-            deserializeJson(doc, data);
-            
-            preferences.begin("heysalad", false);
-            preferences.putString("openai", doc["openai"].as<String>());
-            preferences.putString("elevenlabs", doc["elevenlabs"].as<String>());
-            preferences.putString("gemini", doc["gemini"].as<String>());
-            preferences.putString("deepseek", doc["deepseek"].as<String>());
-            preferences.end();
-            
-            openaiKey = doc["openai"].as<String>();
-            elevenlabsKey = doc["elevenlabs"].as<String>();
-            geminiKey = doc["gemini"].as<String>();
-            deepseekKey = doc["deepseek"].as<String>();
-            
-            request->send(200, "application/json", "{\"ok\":true}");
-        });
     
     server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
         String json = "{";
@@ -605,7 +613,7 @@ void setup() {
     
     server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
         [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-            if (isConfigured) {
+            if (isConfigured || !wifiSSID.isEmpty()) {
                 request->send(403, "application/json", "{\"ok\":false,\"error\":\"already_configured\"}");
                 return;
             }
@@ -617,12 +625,21 @@ void setup() {
 
             String alias = doc["sally_alias"] | "";
             String piBaseUrl = SallySpatialProtocol::trimTrailingSlashes(doc["pi_base_url"] | "");
+            if (piBaseUrl.isEmpty()) piBaseUrl = SallySpatialProtocol::trimTrailingSlashes(doc["server_base_url"] | "");
             String deviceToken = doc["device_token"] | "";
+            String portalAdmin = doc["admin_token"] | "";
             alias.trim();
             deviceToken.trim();
+            portalAdmin.trim();
+            const bool snapshotPresent = !doc["snapshot_interval_sec"].isNull();
+            const long snapshotSec = snapshotPresent ? doc["snapshot_interval_sec"].as<long>() : 0;
             if ((!alias.isEmpty() && !SallySpatialProtocol::isValidAlias(alias)) ||
                 (!piBaseUrl.isEmpty() && !piBaseUrl.startsWith("http://") && !piBaseUrl.startsWith("https://")) ||
-                (!deviceToken.isEmpty() && deviceToken.length() < 32)) {
+                (!deviceToken.isEmpty() &&
+                 !SallyPolicy::isDeviceToken(std::string(deviceToken.c_str()))) ||
+                (!portalAdmin.isEmpty() && portalAdmin.length() < SallyPolicy::kMinAdminTokenLength) ||
+                (snapshotPresent && (snapshotSec < 0 ||
+                 !SallyPolicy::snapshotIntervalAllowed(static_cast<uint32_t>(snapshotSec))))) {
                 request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_spatial_configuration\"}");
                 return;
             }
@@ -633,7 +650,10 @@ void setup() {
             if (!alias.isEmpty()) preferences.putString("sallyAlias", alias);
             if (!piBaseUrl.isEmpty()) preferences.putString("piBaseUrl", piBaseUrl);
             if (!deviceToken.isEmpty()) preferences.putString("deviceToken", deviceToken);
+            if (!portalAdmin.isEmpty()) preferences.putString("adminToken", portalAdmin);
+            if (snapshotPresent) preferences.putUInt("snapshotSec", static_cast<uint32_t>(snapshotSec));
             preferences.putBool("configured", true);
+            preferences.putBool("bleProvLocked", true);
             preferences.end();
             
             request->send(200, "application/json", "{\"ok\":true}");
