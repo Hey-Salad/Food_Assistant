@@ -158,16 +158,32 @@ inline std::string lastHwIdHex6(const std::string& hwId) {
     return "camera";
 }
 
-// mDNS and OTA label, without ".local". A provisioned alias wins. Otherwise
+inline std::string asciiLower(std::string value) {
+    for (char& c : value) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return value;
+}
+
+inline bool hasSallyPrefix(const std::string& value) {
+    return asciiLower(value).compare(0, 6, "sally-") == 0;
+}
+
+// mDNS and OTA label, without ".local". Both services use this string.
+// A provisioned alias wins. "sally-" is not added again when the alias
+// already starts with that prefix, compared case-insensitively. Otherwise
 // the label is sally- plus the last six hex digits of the hardware id.
 inline std::string mdnsHostname(const std::string& alias, const std::string& hwId) {
-    const std::string trimmedAlias = trim(alias);
-    const std::string trimmedId = trim(hwId);
-    const bool useAlias = isValidAlias(trimmedAlias) && trimmedAlias != trimmedId;
-    std::string host = std::string("sally-") + (useAlias ? trimmedAlias : lastHwIdHex6(trimmedId));
+    const std::string loweredAlias = asciiLower(trim(alias));
+    const std::string loweredId = asciiLower(trim(hwId));
+    const bool useAlias = isValidAlias(loweredAlias) && loweredAlias != loweredId;
+    const std::string label = useAlias ? loweredAlias : lastHwIdHex6(loweredId);
+    std::string host = hasSallyPrefix(label) ? label : std::string("sally-") + label;
     if (host.size() > 63) host.resize(63);
     while (!host.empty() && host.back() == '-') host.pop_back();
-    if (host.size() < 2) host = std::string("sally-") + lastHwIdHex6(trimmedId);
+    if (host.size() < std::string("sally-x").size() || host == "sally") {
+        host = std::string("sally-") + lastHwIdHex6(loweredId);
+    }
     return host;
 }
 

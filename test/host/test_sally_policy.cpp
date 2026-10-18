@@ -25,11 +25,17 @@ int main() {
     expect(kHeartbeatIntervalMs == 15000, "heartbeat stays at 15s");
     expect(mdnsHostname("fridge-2", "sally-a8c12904a7ac") == "sally-fridge-2",
            "alias becomes the mDNS name");
+    expect(mdnsHostname("sally-01", "sally-a8c12904a7ac") == "sally-01",
+           "alias that already starts with sally- is not prefixed again");
+    expect(mdnsHostname("Sally-01", "sally-a8c12904a7ac") == "sally-01",
+           "Sally- prefix match is case-insensitive");
+    expect(mdnsHostname("SALLY-02", "sally-bbbbccddeeff") == "sally-02",
+           "uppercase SALLY- prefix is kept once");
     expect(mdnsHostname("", "sally-a8c12904a7ac") == "sally-04a7ac",
            "missing alias uses the last six hardware digits");
     expect(mdnsHostname("sally-a8c12904a7ac", "sally-a8c12904a7ac") == "sally-04a7ac",
            "hardware id used as alias still uses the last six digits");
-    expect(mdnsHostname("Fridge", "sally-bbbbccddeeff") == "sally-ddeeff",
+    expect(mdnsHostname("bad alias", "sally-bbbbccddeeff") == "sally-ddeeff",
            "invalid alias falls back to the hardware id");
     expect(mdnsHostname("cam-a", "sally-111111111111") != mdnsHostname("cam-b", "sally-222222222222"),
            "two aliases do not share a hostname");
